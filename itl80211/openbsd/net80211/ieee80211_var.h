@@ -453,6 +453,11 @@ struct ieee80211com {
     uint64_t ic_wcl_rx_packets[4];
 #endif
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
+    // Callback for AWDL action frames (category 127).  When non-NULL, called
+    // with the raw 802.11 management mbuf so the airport layer can inject it
+    // into awdl0 for awdld to consume via BPF.  The callee is responsible for
+    // freeing the mbuf.
+    void            (*ic_awdl_rx)(struct ieee80211com *, mbuf_t);
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];

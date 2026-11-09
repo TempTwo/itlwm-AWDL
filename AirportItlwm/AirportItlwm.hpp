@@ -89,6 +89,7 @@ public:
                                OSData *                data         = 0) override;
     
     static IOReturn setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3);
+    static void awdlRxCallback(struct ieee80211com *ic, mbuf_t m);
     
 #ifdef __PRIVATE_SPI__
     virtual IOReturn outputStart(IONetworkInterface *interface, IOOptionBits options) override;

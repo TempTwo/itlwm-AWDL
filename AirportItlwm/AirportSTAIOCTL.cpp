@@ -1453,12 +1453,16 @@ getSCAN_RESULT(OSObject *object, struct apple80211_scan_result **sr)
 IOReturn AirportItlwm::
 setVIRTUAL_IF_CREATE(OSObject *object, struct apple80211_virt_if_create_data* data)
 {
-    // From Ventura, the virtual interface sequence has channged, now temporary disabled the virtual interface creation because it is no functionality. This fix the issue of delaying start time of associating to AP.
+    // On Ventura and later, P2P virtual interfaces are disabled (causes AP association delay).
+    // On Sequoia (MAC_15_2+), AWDL virtual interface creation is re-enabled to support AirDrop
+    // via the awdld userspace daemon.  P2P remains disabled for now.
 #if __IO80211_TARGET >= __MAC_13_0
-    return kIOReturnUnsupported;
-#else
+    if (data->role != APPLE80211_VIF_AWDL) {
+        XYLog("%s role=%d not supported on this target\n", __FUNCTION__, data->role);
+        return kIOReturnUnsupported;
+    }
+#endif
     struct ether_addr addr;
-    struct apple80211_channel chann;
     XYLog("%s role=%d, bsd_name=%s, mac=%s, unk1=%d\n", __FUNCTION__, data->role, data->bsd_name,
           ether_sprintf(data->mac), data->unk1);
     if (data->role == APPLE80211_VIF_P2P_DEVICE) {
@@ -1485,17 +1489,17 @@ setVIRTUAL_IF_CREATE(OSObject *object, struct apple80211_virt_if_create_data* da
             return kIOReturnError;
         memcpy(addr.octet, data->mac, 6);
         inf->init(this, &addr, data->role, "awdl");
-        chann.channel = 149;
-        chann.version = 1;
-        chann.flags = APPLE80211_C_FLAG_5GHZ | APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_80MHZ;
-        setInfraChannel(&chann);
+        // NOTE: Do NOT call setInfraChannel() here — that would switch the primary STA
+        // interface off its associated AP channel, breaking normal Wi-Fi connectivity.
+        // awdld manages channel scheduling on awdl0 independently via AWDL_MASTER_CHANNEL
+        // and AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE ioctls.
         fAWDLInterface = inf;
+        XYLog("%s awdl0 interface created successfully\n", __FUNCTION__);
     } else {
         XYLog("%s unhandled virtual interface role type: %d\n", __FUNCTION__, data->role);
         return kIOReturnError;
     }
     return kIOReturnSuccess;
-#endif
 }
 
 IOReturn AirportItlwm::

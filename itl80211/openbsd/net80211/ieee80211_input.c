@@ -3524,6 +3524,17 @@ ieee80211_recv_action(struct ieee80211com *ic, mbuf_t m,
 #endif
             }
             break;
+        case 127:
+            // AWDL vendor-specific action frames (Apple OUI 00:17:f2, category 127).
+            // Forward to the airport layer so it can inject the frame into awdl0
+            // for the awdld userspace daemon to consume via BPF.
+            // Note: mbuf ownership is transferred — the callback must free it.
+            if (ic->ic_awdl_rx != NULL) {
+                ic->ic_awdl_rx(ic, m);
+                return; // ownership transferred, do not fall through
+            }
+            DPRINTF(("awdl action frame but ic_awdl_rx not set\n"));
+            break;
         default:
             DPRINTF(("action frame category %d not handled\n", frm[0]));
             break;
