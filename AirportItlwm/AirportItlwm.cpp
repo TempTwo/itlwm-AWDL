@@ -16,7 +16,6 @@
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
 #include <net80211/ieee80211_var.h>
-#include <net80211/ieee80211_radiotap.h>
 
 #define super IO80211Controller
 OSDefineMetaClassAndStructors(AirportItlwm, IO80211Controller);
@@ -389,7 +388,6 @@ bool AirportItlwm::start(IOService *provider)
     }
     fHalService->initWithController(this, _fWorkloop, _fCommandGate);
     fHalService->get80211Controller()->ic_event_handler = eventHandler;
-    fHalService->get80211Controller()->ic_awdl_rx = awdlRxCallback;
     
     if (PE_parse_boot_argn("-novht", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOVHT;
@@ -959,95 +957,20 @@ enableFeature(IO80211FeatureCode code, void *data)
     return 102;
 }
 
-// awdlRxCallback — called from ieee80211_recv_action when a category-127 (AWDL) action
-// frame is received from the air.  We inject it into awdl0 so that awdld can read it
-// via its BPF socket on that interface.
-void AirportItlwm::
-awdlRxCallback(struct ieee80211com *ic, mbuf_t m)
-{
-    // Retrieve the AirportItlwm controller from the ifnet->iface pointer that
-    // was stored when attachInterface() was called.
-    IO80211Interface *iface = OSDynamicCast(IO80211Interface, ic->ic_ac.ac_if.iface);
-    if (iface == NULL) {
-        mbuf_freem(m);
-        return;
-    }
-    AirportItlwm *that = OSDynamicCast(AirportItlwm, iface->getController());
-    if (that == NULL || that->fAWDLInterface == NULL) {
-        mbuf_freem(m);
-        return;
-    }
-
-    XYLog("awdlRxCallback: len=%zu injecting into awdl0\n", mbuf_len(m));
-
-    // inputPacket delivers the mbuf to the awdl0 interface and taps any BPF
-    // listeners (including awdld's BPF socket).
-    that->fAWDLInterface->inputPacket(m);
-}
-
-// outputActionFrame — called by bpfOutputPacket for DLT_RAW frames written to awdl0 by awdld.
-// The mbuf contains a raw 802.11 management frame (no radiotap header).
-// We place it on the hardware management queue so the firmware transmits it.
 int AirportItlwm::
 outputActionFrame(OSObject *object, mbuf_t m)
 {
-    size_t len = mbuf_len(m);
-    XYLog("%s len=%zu\n", __FUNCTION__, len);
-
-    struct ieee80211com *ic = fHalService->get80211Controller();
-    struct _ifnet *ifp = &ic->ic_ac.ac_if;
-
-    // Verify we have at least a minimal 802.11 header
-    if (len < sizeof(struct ieee80211_frame)) {
-        XYLog("%s frame too short (%zu)\n", __FUNCTION__, len);
-        mbuf_freem(m);
-        return EINVAL;
-    }
-
-    // The frame written by awdld already has a full 802.11 MAC header.
-    // We just need to tag the mbuf with the BSS node so the driver can
-    // find the right tx queue / rate set.  Use ic_bss as the node
-    // (broadcast / management path — no association needed for AWDL).
-    mbuf_pkthdr_setrcvif(m, (ifnet_t)ic->ic_bss);
-
-    mq_enqueue(&ic->ic_mgtq, m);
-    ifp->if_timer = 1;
-    ifp->if_start(ifp);
+    XYLog("%s len=%zu\n", __FUNCTION__, mbuf_len(m));
+    mbuf_freem(m);
     return 0;
 }
 
-// bpfOutput80211Radio — called by bpfOutputPacket for DLT_IEEE802_11_RADIO frames.
-// The mbuf starts with a radiotap header followed by the 802.11 frame.
-// Strip the radiotap header then forward to outputActionFrame.
 int AirportItlwm::
 bpfOutput80211Radio(OSObject *object, mbuf_t m)
 {
-    size_t len = mbuf_len(m);
-    XYLog("%s len=%zu\n", __FUNCTION__, len);
-
-    // Need at least the radiotap header base
-    if (len < sizeof(struct ieee80211_radiotap_header)) {
-        XYLog("%s frame too short for radiotap (%zu)\n", __FUNCTION__, len);
-        mbuf_freem(m);
-        return EINVAL;
-    }
-
-    // Read the radiotap header length from the mbuf
-    struct ieee80211_radiotap_header rth;
-    mbuf_copydata(m, 0, sizeof(rth), &rth);
-    uint16_t rth_len = le16toh(rth.it_len);
-
-    if (rth_len < sizeof(struct ieee80211_radiotap_header) || rth_len >= len) {
-        XYLog("%s bad radiotap it_len=%u total=%zu\n", __FUNCTION__, rth_len, len);
-        mbuf_freem(m);
-        return EINVAL;
-    }
-
-    // Strip the radiotap header
-    mbuf_adj(m, rth_len);
-
-    // Now treat as a raw 802.11 frame
-    return outputActionFrame(object, m);
+    XYLog("%s len=%zu\n", __FUNCTION__, mbuf_len(m));
+    mbuf_freem(m);
+    return 0;
 }
 
 SInt32 AirportItlwm::
@@ -1111,30 +1034,20 @@ bpfOutputPacket(OSObject *object, UInt dltType, mbuf_t m)
 void AirportItlwm::
 requestPacketTx(void *object, UInt )
 {
+    UInt32 ret;
+    struct TxPacketRequest request;
     if (object == NULL)
         return;
     IO80211VirtualInterface *interface = OSDynamicCast(IO80211VirtualInterface, (OSObject *)object);
-    if (interface == NULL)
-        return;
-
-    if (interface->getInterfaceRole() == APPLE80211_VIF_AWDL) {
-        // Dequeue packets that awdld has placed on the awdl0 interface and
-        // submit them to the hardware via outputPacket.  The packets have
-        // already been prepared by awdld as 802.11 frames so they just need
-        // to reach the firmware tx queue.
-        struct TxPacketRequest request;
+    if (interface) {
         memset(&request, 0, sizeof(request));
-        interface->dequeueTxPackets(&request);
-
-        mbuf_t m = NULL;
-        // Walk the dequeued packet list (request.packets is an mbuf chain / array
-        // depending on IO80211 version; submit one at a time).
-        for (UInt32 i = 0; i < request.packetCount; i++) {
-            m = request.packets[i];
-            if (m == NULL)
-                continue;
-            UInt32 ret = outputPacket(m, (void *)interface);
-            interface->reportTransmitStatus(m, ret, NULL);
+        if (interface->getInterfaceRole() == APPLE80211_VIF_AWDL) {
+//            interface->dequeueTxPackets(&request);
+//
+//            ret = outputPacket(NULL, interface);
+//            if (ret == kIOReturnSuccess) {
+//                interface->reportTransmitStatus(NULL, ret, NULL);
+//            }
         }
     }
 }
